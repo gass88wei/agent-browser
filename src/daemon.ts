@@ -6,6 +6,9 @@ import { BrowserManager } from './browser.js';
 import { parseCommand, serializeResponse, errorResponse } from './protocol.js';
 import { executeCommand } from './actions.js';
 
+// Platform detection
+const isWindows = process.platform === 'win32';
+
 // Session support - each session gets its own socket/pid
 let currentSession = process.env.AGENT_BROWSER_SESSION || 'default';
 
@@ -24,11 +27,36 @@ export function getSession(): string {
 }
 
 /**
- * Get the socket path for the current session
+ * Get port number for TCP mode (Windows)
+ * Uses a hash of the session name to get a consistent port
+ */
+function getPortForSession(session: string): number {
+  let hash = 0;
+  for (let i = 0; i < session.length; i++) {
+    hash = ((hash << 5) - hash) + session.charCodeAt(i);
+    hash |= 0;
+  }
+  // Port range 49152-65535 (dynamic/private ports)
+  return 49152 + (Math.abs(hash) % 16383);
+}
+
+/**
+ * Get the socket path for the current session (Unix) or port (Windows)
  */
 export function getSocketPath(session?: string): string {
   const sess = session ?? currentSession;
+  if (isWindows) {
+    return String(getPortForSession(sess));
+  }
   return path.join(os.tmpdir(), `agent-browser-${sess}.sock`);
+}
+
+/**
+ * Get the port file path for Windows (stores the port number)
+ */
+export function getPortFile(session?: string): string {
+  const sess = session ?? currentSession;
+  return path.join(os.tmpdir(), `agent-browser-${sess}.port`);
 }
 
 /**
@@ -48,7 +76,7 @@ export function isDaemonRunning(session?: string): boolean {
 
   try {
     const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-    // Check if process exists
+    // Check if process exists (works on both Unix and Windows)
     process.kill(pid, 0);
     return true;
   } catch {
@@ -59,14 +87,31 @@ export function isDaemonRunning(session?: string): boolean {
 }
 
 /**
+ * Get connection info for the current session
+ * Returns { type: 'unix', path: string } or { type: 'tcp', port: number }
+ */
+export function getConnectionInfo(session?: string): { type: 'unix'; path: string } | { type: 'tcp'; port: number } {
+  const sess = session ?? currentSession;
+  if (isWindows) {
+    return { type: 'tcp', port: getPortForSession(sess) };
+  }
+  return { type: 'unix', path: path.join(os.tmpdir(), `agent-browser-${sess}.sock`) };
+}
+
+/**
  * Clean up socket and PID file for the current session
  */
 export function cleanupSocket(session?: string): void {
-  const socketPath = getSocketPath(session);
   const pidFile = getPidFile(session);
   try {
-    if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
     if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+    if (isWindows) {
+      const portFile = getPortFile(session);
+      if (fs.existsSync(portFile)) fs.unlinkSync(portFile);
+    } else {
+      const socketPath = getSocketPath(session);
+      if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+    }
   } catch {
     // Ignore cleanup errors
   }
@@ -144,15 +189,26 @@ export async function startDaemon(): Promise<void> {
     });
   });
 
-  const socketPath = getSocketPath();
   const pidFile = getPidFile();
 
   // Write PID file before listening
   fs.writeFileSync(pidFile, process.pid.toString());
 
-  server.listen(socketPath, () => {
-    // Daemon is ready
-  });
+  if (isWindows) {
+    // Windows: use TCP socket on localhost
+    const port = getPortForSession(currentSession);
+    const portFile = getPortFile();
+    fs.writeFileSync(portFile, port.toString());
+    server.listen(port, '127.0.0.1', () => {
+      // Daemon is ready on TCP port
+    });
+  } else {
+    // Unix: use Unix domain socket
+    const socketPath = getSocketPath();
+    server.listen(socketPath, () => {
+      // Daemon is ready
+    });
+  }
 
   server.on('error', (err) => {
     console.error('Server error:', err);

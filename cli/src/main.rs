@@ -2,14 +2,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{exit, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+// Unix socket support (Unix only)
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct Request {
     id: String,
     action: String,
@@ -24,6 +29,61 @@ struct Response {
     error: Option<String>,
 }
 
+// Connection type abstraction
+#[allow(dead_code)]
+enum Connection {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Read for Connection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.read(buf),
+            Connection::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Connection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.write(buf),
+            Connection::Tcp(s) => s.write(buf),
+        }
+    }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.flush(),
+            Connection::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+impl Connection {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.set_read_timeout(dur),
+            Connection::Tcp(s) => s.set_read_timeout(dur),
+        }
+    }
+    
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.set_write_timeout(dur),
+            Connection::Tcp(s) => s.set_write_timeout(dur),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn get_socket_path(session: &str) -> PathBuf {
     let tmp = env::temp_dir();
     tmp.join(format!("agent-browser-{}.sock", session))
@@ -34,6 +94,25 @@ fn get_pid_path(session: &str) -> PathBuf {
     tmp.join(format!("agent-browser-{}.pid", session))
 }
 
+#[cfg(windows)]
+fn get_port_path(session: &str) -> PathBuf {
+    let tmp = env::temp_dir();
+    tmp.join(format!("agent-browser-{}.port", session))
+}
+
+/// Get port number for TCP mode (Windows)
+/// Uses a hash of the session name to get a consistent port
+#[cfg(windows)]
+fn get_port_for_session(session: &str) -> u16 {
+    let mut hash: i32 = 0;
+    for c in session.chars() {
+        hash = ((hash << 5).wrapping_sub(hash)).wrapping_add(c as i32);
+    }
+    // Port range 49152-65535 (dynamic/private ports)
+    49152 + ((hash.abs() as u16) % 16383)
+}
+
+#[cfg(unix)]
 fn is_daemon_running(session: &str) -> bool {
     let pid_path = get_pid_path(session);
     if !pid_path.exists() {
@@ -49,10 +128,38 @@ fn is_daemon_running(session: &str) -> bool {
     false
 }
 
+#[cfg(windows)]
+fn is_daemon_running(session: &str) -> bool {
+    let pid_path = get_pid_path(session);
+    if !pid_path.exists() {
+        return false;
+    }
+    // On Windows, try to connect to the port to check if daemon is running
+    let port = get_port_for_session(session);
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        Duration::from_millis(100)
+    ).is_ok()
+}
+
+fn daemon_ready(session: &str) -> bool {
+    #[cfg(unix)]
+    {
+        get_socket_path(session).exists()
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, try to connect to verify daemon is ready
+        let port = get_port_for_session(session);
+        TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_millis(50)
+        ).is_ok()
+    }
+}
+
 fn ensure_daemon(session: &str, headed: bool) -> Result<(), String> {
-    let socket_path = get_socket_path(session);
-    
-    if is_daemon_running(session) && socket_path.exists() {
+    if is_daemon_running(session) && daemon_ready(session) {
         return Ok(());
     }
     
@@ -86,7 +193,7 @@ fn ensure_daemon(session: &str, headed: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to start daemon: {}", e))?;
     
     for _ in 0..50 {
-        if socket_path.exists() {
+        if daemon_ready(session) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -95,10 +202,25 @@ fn ensure_daemon(session: &str, headed: bool) -> Result<(), String> {
     Err("Daemon failed to start".to_string())
 }
 
+fn connect(session: &str) -> Result<Connection, String> {
+    #[cfg(unix)]
+    {
+        let socket_path = get_socket_path(session);
+        UnixStream::connect(&socket_path)
+            .map(Connection::Unix)
+            .map_err(|e| format!("Failed to connect: {}", e))
+    }
+    #[cfg(windows)]
+    {
+        let port = get_port_for_session(session);
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+            .map(Connection::Tcp)
+            .map_err(|e| format!("Failed to connect: {}", e))
+    }
+}
+
 fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    let socket_path = get_socket_path(session);
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+    let mut stream = connect(session)?;
     
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
@@ -166,7 +288,7 @@ fn clean_args(args: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     let mut skip_next = false;
     
-    for (i, arg) in args.iter().enumerate() {
+    for (_i, arg) in args.iter().enumerate() {
         if skip_next {
             skip_next = false;
             continue;
@@ -491,7 +613,7 @@ fn print_response(resp: &Response, json_mode: bool) {
     }
     
     if !resp.success {
-        eprintln!("\x1b[31m✗ Error:\x1b[0m {}", resp.error.as_deref().unwrap_or("Unknown error"));
+        eprintln!("\x1b[31m✗\x1b[0m {}", resp.error.as_deref().unwrap_or("Unknown error"));
         return;
     }
     
@@ -804,13 +926,26 @@ fn run_install(with_deps: bool) {
 }
 
 fn which_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        Command::new("which")
+            .arg(cmd)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        Command::new("where")
+            .arg(cmd)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 fn main() {
@@ -843,7 +978,7 @@ fn main() {
         if flags.json {
             println!(r#"{{"success":false,"error":"{}"}}"#, e);
         } else {
-            eprintln!("\x1b[31m✗ Error:\x1b[0m {}", e);
+            eprintln!("\x1b[31m✗\x1b[0m {}", e);
         }
         exit(1);
     }
@@ -870,7 +1005,7 @@ fn main() {
             if flags.json {
                 println!(r#"{{"success":false,"error":"{}"}}"#, e);
             } else {
-                eprintln!("\x1b[31m✗ Error:\x1b[0m {}", e);
+                eprintln!("\x1b[31m✗\x1b[0m {}", e);
             }
             exit(1);
         }

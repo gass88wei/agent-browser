@@ -2,6 +2,10 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Code Style
+
+- Do not use emojis in code, output, or documentation. Unicode symbols (✓, ✗, →, ⚠) are acceptable.
+
 <!-- opensrc:start -->
 
 ## Source Code Reference

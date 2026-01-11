@@ -10,12 +10,13 @@ RUN apt-get update && apt-get install -y \
     mingw-w64 \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Rust targets (Unix only - Windows uses Node.js fallback due to Unix socket dependency)
+# Add Rust targets for all platforms
 RUN rustup target add \
     x86_64-unknown-linux-gnu \
     aarch64-unknown-linux-gnu \
     x86_64-apple-darwin \
-    aarch64-apple-darwin
+    aarch64-apple-darwin \
+    x86_64-pc-windows-gnu
 
 # Install cargo-zigbuild for easier cross-compilation (especially macOS)
 RUN curl -sSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt \
